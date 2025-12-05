@@ -1,38 +1,200 @@
-# This is a basic workflow to help you get started with Actions
+#Compare Test to GitLab #2
+name: Build and Deploy
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
+    tags:
+      - "*"
 
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+  NODE_ENV: ${{ vars.NODE_ENV }} 
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  TASK_FAMILY: ${{ vars.TASK_FAMILY }}
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  # ------------------------------------------------------------------
+  # BUILD AND PUSH
+  # ------------------------------------------------------------------
+  build_and_push:
     runs-on: ubuntu-latest
+    outputs:
+      full_image: ${{ steps.vars.outputs.full_image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.GHCR }}
+          username: ${{ vars.GH_USER }}
+          password: ${{ secrets.GH_PASS }}
+
+      - name: Bump version in package.json
+        run: |
+          if [ -f package.json ]; then
+            CURRENT_VERSION=$(jq -r ".version" package.json)
+            IFS="." read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+            MAJOR=${MAJOR:-0}; MINOR=${MINOR:-0}; PATCH=${PATCH:-0}
+
+            if [[ "$VERSION_BUMP" == "major" ]]; then
+              ((MAJOR+=1)); MINOR=0; PATCH=0
+            elif [[ "$VERSION_BUMP" == "minor" ]]; then
+              ((MINOR+=1)); PATCH=0
+            else
+              ((PATCH+=1))
+            fi
+
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            echo "PACKAGE_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+            jq --arg v "$NEW_VERSION" '.version = $v' package.json > tmp && mv tmp package.json
+          fi
+
+      - name: Commit version bump
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "dylanrmrz"
+          git config user.email "dylan.ramirez@lansa.com"
+          git add package.json
+          git commit -m "ci: bump version to v${PACKAGE_VERSION} [skip ci]" || true
+          git push || true
+
+      - name: Set image tag
+        id: vars
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == "main" ]]; then TAG="${PACKAGE_VERSION}"; fi
+          FULL_IMAGE="${IMAGE_NAME}:${TAG}"
+
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "full_image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t "$IMAGE_NAME:$TAG" .
+
+      - name: Push Docker image
+        run: docker push "$IMAGE_NAME:$TAG"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: package.json
+
+  # ------------------------------------------------------------------
+  # MANUAL TESTING + APPROVAL
+  # ------------------------------------------------------------------
+  manual_approval:
+    runs-on: ubuntu-latest
+    needs: build_and_push
+    outputs:
+      docker_image: ${{ needs.build_and_push.outputs.full_image }}
+
+    steps:
+      - name: Display Image for Testing
+        run: |
+          echo "The following image is ready for manual testing:"
+          echo "${{ needs.build_and_push.outputs.full_image }}"
+
+      - name: Pause for Manual QA / Approval
+        run: |
+          echo "Waiting for approval inside GitHub → Environments → manual-testing"
+
+      # ----------------------------------------------------
+      # SUCCESS NOTIFICATION AFTER APPROVAL
+      # ----------------------------------------------------
+      - name: Send Success Email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: dylan.ramirez@lansa.com
+          password: "brtt cicb ylhr pqiz"
+          from: dylan.ramirez@lansa.com
+          to: cenext.lansa@gmail.com
+          subject: "Manual Testing Approved — Ready for Deployment"
+          body: |
+            CI/CD Notification
+            Repository: ${{ github.repository }}
+            Manual Testing Result: APPROVED
+            Image: ${{ needs.build_and_push.outputs.full_image }}
+            Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # ----------------------------------------------------
+      # FAILURE NOTIFICATION IF QA REJECTS
+      # ----------------------------------------------------
+      - name: Send Failure Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: dylan.ramirez@lansa.com
+          password: "brtt cicb ylhr pqiz"
+          from: "Pipeline Bot <devops@lansa.com>"
+          to: dylan.ramirez@lansa.com
+          subject: "❌ Manual Testing FAILED"
+          body: |
+            The manual testing approval failed or was rejected.
+
+            Repository: ${{ github.repository }}
+            Image: ${{ needs.build_and_push.outputs.full_image }}
+            Run ID: ${{ github.run_id }}
+
+  # ------------------------------------------------------------------
+  # DEPLOY — Only runs AFTER approved manual testing
+  # ------------------------------------------------------------------
+  deploy:
+    runs-on: ubuntu-latest
+    needs: manual_approval
     environment:
       name: production
+    env:
+      FULL_IMAGE: ${{ needs.manual_approval.outputs.docker_image }}
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Update ECS Task Definition
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          echo "Deploying Image: $FULL_IMAGE"
+
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --query taskDefinition > td.json
+          jq --arg IMAGE "$FULL_IMAGE" '
+            .containerDefinitions[0].image = $IMAGE
+            | {family, networkMode, executionRoleArn, containerDefinitions, requiresCompatibilities, cpu, memory, volumes}
+            + (if .taskRoleArn != null then {taskRoleArn} else {} end)
+          ' td.json > new-td.json
+          aws ecs register-task-definition --cli-input-json file://new-td.json
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_FAMILY" \
+            --force-new-deployment
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
